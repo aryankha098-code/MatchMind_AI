@@ -1,31 +1,68 @@
 """
-analyz.py
-Analyze a full football match video in one pass and output timestamps.json.
+analyze.py
+Analyze a full football match video and output timestamps.json.
 
-Provider priority: Gemini (GEMINI_API_KEY) → Gemma4 (GEMMA_API_KEY).
-The entire video is uploaded and analyzed as a single unit — no chunking.
-Timestamps returned by the model are validated to cover the full match duration.
+Provider priority: Gemini (GEMINI_API_KEY) -> Gemma (GEMMA_API_KEY).
 
-Changes vs. previous version:
-  • TWO-PASS analysis:
-      Pass 1 — Goals-only scan at higher FPS/quality proxy for precise timestamps.
-      Pass 2 — Full highlights scan (existing behaviour).
-    Goal timestamps from Pass 1 always override any goal found in Pass 2.
-  • Goal-dedicated proxy uses 12fps + higher quality (CRF 22) so short-duration
-    events (ball crossing the line, net billowing) are captured on distinct frames.
-  • Goal-specific prompt is highly focused: model only outputs goals and is given
-    explicit visual cues (net movement, celebrations, scoreboard change, referee
-    pointing to centre circle).
-  • _refine_goal_timestamps() does a ±15-second window re-query for each
-    candidate goal to pin the exact frame, removing systematic early/late bias.
-  • Goals from Pass 1 are injected into Pass 2 results and any duplicate goal
-    within ±20 s is removed from Pass 2 to avoid double-counting.
-  • Extended VALID_TYPES to accept extra labels the model sometimes returns
-    (kick_off, header, corner, offside, substitution, penalty_miss, own_goal,
-     handball, var_review, injury) — all mapped to the nearest valid canonical type.
-  • Server-disconnect on large upload is now retried with exponential back-off.
-  • 429 responses honour the retryDelay the API sends instead of fixed sleeps.
-  • Gemini upload is retried up to MAX_UPLOAD_RETRIES times before giving up.
+── Why this version is different (v4 — chunked analysis) ─────────────────────
+Three concrete accuracy bugs were found in the previous single-pass design:
+
+  1. WRONG ASSUMPTION ABOUT FPS.
+     Gemini's File API samples uploaded video at a fixed 1 frame/second by
+     default, REGARDLESS of the frame rate the file was encoded at. Encoding
+     a "12fps goal proxy" bought nothing — Gemini still only saw 1 frame per
+     second unless the request explicitly overrides this via
+     `video_metadata.fps` on the request Part. This version sets that field
+     explicitly on every call (see `_video_part`).
+
+  2. LOCALIZING A TIMESTAMP ACROSS A 90-MINUTE VIDEO IN ONE CALL IS INHERENTLY
+     IMPRECISE. Long-video temporal grounding is a known weak point for
+     current vision-language models — the model is effectively estimating
+     "roughly how far through the video" an event was, which is why the same
+     goal might get reported anywhere from 5-30s off. This version instead
+     CHUNKS the match into short (default 8 min), overlapping clips and asks
+     for timestamps RELATIVE TO EACH CLIP. Grounding a timestamp inside an
+     8-minute clip is a much easier problem than inside a 100-minute one.
+     Chunk-relative timestamps are converted back to absolute match time
+     after each chunk is analyzed, and overlap regions are de-duplicated.
+
+  3. THE MODEL HAS NO GROUND TRUTH FOR "WHAT SECOND IS THIS". This version
+     burns a running HH:MM:SS clock into the top-left corner of every chunk
+     proxy (ffmpeg drawtext), relative to the start of that chunk. Instead of
+     estimating time from pacing/context, the model can read the exact
+     second directly off the frame -- turning a hard temporal-grounding
+     problem into an easy OCR-style reading problem. The bundled font at
+     assets/fonts/DejaVuSans-Bold.ttf is used so this works identically on
+     Windows, Docker, and any other host without relying on system fonts.
+
+The frame-accurate CV refinement stage (event_refiner.py) is unchanged and
+still runs after this script — it remains the right layer for sub-second
+correction; this script's job is to get the LLM's rough timestamp close
+enough (typically within a couple of seconds) for that refiner to work with.
+
+── v5 changes — fixing missed/misidentified goals ────────────────────────────
+Three more bugs, found by comparing this script against the actual Gemini
+video-understanding docs, that were actively hurting goal accuracy:
+
+  4. AUDIO WAS BEING THROWN AWAY. `create_chunk_proxy` ran ffmpeg with `-an`,
+     stripping the audio track entirely before upload. Gemini processes audio
+     and video as separate streams, and for goal detection the crowd roar /
+     commentator reaction is often the single clearest, fastest signal that a
+     goal just happened — much more reliable than trying to visually catch a
+     net bulge that may be obscured by players or a quick replay cut. The
+     proxy now keeps a low-bitrate mono audio track (`ANALYZE_KEEP_AUDIO=true`
+     by default), and the goal prompt explicitly tells the model to listen
+     for it.
+
+  5. THE PROXY WAS TOO COMPRESSED TO SEE THE THING IT WAS BEING ASKED TO
+     FIND. 640px width at CRF 23 blurs out net movement and ball position for
+     shots on the far side of the pitch — exactly the detail a goal call
+     depends on. Bumped to 960px / CRF 18.
+
+  6. FLASH WAS THE DEFAULT MODEL FOR A PASS WHERE ACCURACY MATTERS MOST.
+     gemini-2.5-flash is default now gemini-2.5-pro. Flash is cheaper/faster
+     but noticeably less reliable at fine-grained visual judgment calls; the
+     goal pass is exactly the wrong place to make that trade.
 """
 
 from __future__ import annotations
@@ -38,46 +75,81 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 
 # ── File paths ────────────────────────────────────────────────────────────────
-INPUT_VIDEO              = os.path.join(".", "match.mp4")
-ANALYSIS_PROXY_VIDEO     = os.path.join(".", "analysis_proxy.mp4")
-GOAL_PROXY_VIDEO         = os.path.join(".", "goal_proxy.mp4")
-OUTPUT_JSON              = os.path.join(".", "timestamps.json")
+INPUT_VIDEO   = os.path.join(".", "match.mp4")
+OUTPUT_JSON   = os.path.join(".", "timestamps.json")
+CHUNK_WORKDIR = os.path.join(".", "_analyze_chunks")
+
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+BUNDLED_FONT = os.path.join(SCRIPT_DIR, "assets", "fonts", "DejaVuSans-Bold.ttf")
 
 # ── Model defaults ────────────────────────────────────────────────────────────
+# Waterfall: try the newest/best model first; on a hard failure for that model
+# (not just a transient quota error — those retry in place first, see
+# _is_transient / _sleep_for_retry) fall through to the next one down.
+#
+# Status check as of the last time this list was verified against Google's
+# docs (2026-07-29) — model availability in this generation shifts fast, so
+# re-check https://ai.google.dev/gemini-api/docs/models before assuming this
+# is still current:
+#   gemini-3.6-flash     - current GA flash-tier model, released 2026-07-21.
+#   gemini-3.5-flash     - previous flash-tier GA model, still callable.
+#   gemini-3.1-flash-lite- there is no plain "gemini-3.1-flash"; flash-lite is
+#                          the closest match in that generation.
+#   gemini-2.5-flash     - officially deprecated (shutdown 2026-10-16), and
+#                          already returning intermittent 404s in some regions
+#                          well before that date — treat as unreliable, not gone.
+#   gemini-2.0-flash     - ALREADY SHUT DOWN (2026-06-01). Kept only as an
+#                          inert last resort; will fail fast (404) every time.
+#   gemini-1.5-flash     - ALREADY SHUT DOWN. Same as above — dead weight but
+#                          harmless, since a hard failure just falls through
+#                          to the next candidate instead of retrying forever.
 DEFAULT_GEMMA_MODEL              = "gemma-4-27b-it"
-DEFAULT_MODEL                    = "gemini-2.5-flash"
-DEFAULT_GEMINI_FALLBACK_MODELS   = ("gemini-1.5-flash", "gemini-2.0-flash")
+DEFAULT_MODEL                    = "gemini-3.6-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS   = (
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+)
 
-# ── General proxy settings ────────────────────────────────────────────────────
-DEFAULT_PROXY_WIDTH = 480   # px
-DEFAULT_PROXY_FPS   = 4     # fps  (general highlights)
-DEFAULT_PROXY_CRF   = 28    # quality
+# ── Chunking settings ──────────────────────────────────────────────────────────
+# Shorter chunks = better timestamp grounding, more API calls (cost/time).
+# 8 min with 20s overlap is a reasonable default for a ~90-100 min match.
+DEFAULT_CHUNK_SECONDS         = 480   # 8 minutes
+DEFAULT_CHUNK_OVERLAP_SECONDS = 20
 
-# ── Goal proxy settings (higher quality so net/ball are clearly visible) ──────
-DEFAULT_GOAL_PROXY_WIDTH = 640   # px — wider for scoreboard legibility
-DEFAULT_GOAL_PROXY_FPS   = 12   # fps — enough to catch a fast shot crossing the line
-DEFAULT_GOAL_PROXY_CRF   = 22   # quality — noticeably sharper than general proxy
+# ── Chunk proxy encoding (shared by both goal + general passes) ───────────────
+# 640px/CRF23 was too lossy to reliably show net movement / ball-across-line
+# on far-side action — bumped resolution up and CRF down. This costs more
+# upload bandwidth and slightly more inference time, but the proxy is what
+# the model actually sees, so it directly gates detection accuracy.
+DEFAULT_CHUNK_PROXY_WIDTH = 960   # px — legible net/ball detail + scoreboard
+DEFAULT_CHUNK_PROXY_FPS   = 15    # encoded fps (smooth burned-in clock text)
+DEFAULT_CHUNK_PROXY_CRF   = 18    # lower = higher quality (23 was too lossy)
 
-# ── Goal deduplication tolerance ─────────────────────────────────────────────
-GOAL_MERGE_WINDOW_SECONDS = 20   # goals within this gap are considered the same event
+# ── Gemini internal sampling rate (THIS is what actually controls what the
+#    model sees — independent of the encoded proxy fps above). ────────────────
+DEFAULT_GOAL_SAMPLE_FPS    = 2.0   # denser sampling for the short goal pass
+DEFAULT_GENERAL_SAMPLE_FPS = 1.0   # Gemini's own default, set explicitly anyway
 
-# ── Coverage validation ───────────────────────────────────────────────────────
-MIN_COVERAGE_RATIO          = 0.80
-MIN_COVERAGE_BYPASS_SECS    = 600
-MIN_SEGMENT_COVERAGE_RATIO  = 0.65
-MAX_EVENT_GAP_SECONDS       = 900
+# ── De-duplication across overlapping chunk boundaries ─────────────────────────
+GOAL_MERGE_WINDOW_SECONDS    = 20   # goals within this gap = same event
+GENERIC_MERGE_WINDOW_SECONDS = 8    # other events within this gap = same event
 
 # ── Retry / polling ───────────────────────────────────────────────────────────
 POLL_SECONDS               = 5
-PROCESSING_TIMEOUT_SECONDS = 45 * 60
-MAX_PROMPT_RETRIES         = 4
+PROCESSING_TIMEOUT_SECONDS = 20 * 60
+MAX_PROMPT_RETRIES         = 3
 MAX_UPLOAD_RETRIES         = 3
 API_RETRIES_PER_CALL       = 4
 API_RETRY_BASE_SECONDS     = 10
@@ -159,6 +231,19 @@ def _get_int_env(name: str, default: int) -> int:
         v = int(raw)
     except ValueError:
         raise AnalysisError(f"{name} must be an integer.")
+    if v <= 0:
+        raise AnalysisError(f"{name} must be > 0.")
+    return v
+
+
+def _get_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        raise AnalysisError(f"{name} must be a number.")
     if v <= 0:
         raise AnalysisError(f"{name} must be > 0.")
     return v
@@ -246,185 +331,230 @@ def probe_duration(path: str) -> float:
     return duration
 
 
-def create_proxy(input_path: str, proxy_path: str) -> str:
+# ══════════════════════════════════════════════════════════════════════════════
+# Chunking
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ChunkSpec:
+    index: int
+    start: float
+    end: float
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+def compute_chunks(
+    duration: float, chunk_seconds: float, overlap_seconds: float
+) -> list[ChunkSpec]:
     """
-    Transcode the full match to a small proxy while keeping the timeline intact.
-    Verifies the proxy duration matches the original before returning.
+    Split [0, duration] into overlapping, roughly EQUAL-length chunks.
+    Overlap lets the same real event get seen by two chunks near a boundary;
+    dedupe_events() collapses that back into a single event afterwards, so
+    nothing is lost or doubled.
+
+    Why equal-length instead of "fixed size + whatever's left over":
+    The previous version always cut fixed `chunk_seconds`-long pieces and
+    left the remainder as its own trailing chunk, only folding that
+    remainder into the previous chunk if it was under 25% of chunk_seconds.
+    That meant, e.g., a 10-minute match (600s) at the 480s default produced
+    an 8-minute chunk + a lopsided 2.3-minute chunk — not wrong, but an
+    unnecessary, unbalanced split for a video that's barely longer than one
+    chunk to begin with. Solving for an even chunk length given the desired
+    overlap removes that lopsidedness entirely, for any match length.
     """
-    if not _get_bool_env("ANALYZE_USE_PROXY", True):
-        logging.info("Proxy disabled — using original video.")
-        return input_path
+    if duration <= chunk_seconds:
+        return [ChunkSpec(0, 0.0, duration)]
 
-    ensure_ffmpeg()
+    step_target = chunk_seconds - overlap_seconds
+    if step_target <= 0:
+        raise AnalysisError("Chunk overlap must be smaller than chunk duration.")
 
-    width = _get_int_env("ANALYZE_PROXY_WIDTH", DEFAULT_PROXY_WIDTH)
-    fps   = _get_int_env("ANALYZE_PROXY_FPS",   DEFAULT_PROXY_FPS)
-    crf   = _get_int_env("ANALYZE_PROXY_CRF",   DEFAULT_PROXY_CRF)
+    # How many chunks of ~chunk_seconds (net of overlap) does this need?
+    n = max(1, -(-(duration - overlap_seconds) // step_target))  # ceil division
+    n = int(n)
 
-    if os.path.isfile(proxy_path):
-        os.remove(proxy_path)
+    if n == 1:
+        return [ChunkSpec(0, 0.0, duration)]
 
-    logging.info("Creating general proxy: %spx, %sfps, CRF %s …", width, fps, crf)
+    # Solve for the equal chunk length L such that n chunks of length L,
+    # each stepping forward by (L - overlap_seconds), exactly span `duration`:
+    #   (n - 1) * (L - overlap_seconds) + L = duration
+    L = (duration + (n - 1) * overlap_seconds) / n
+    step = L - overlap_seconds
 
-    run_command(
-        [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", f"scale={width}:-2,fps={fps}",
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", str(crf),
-            "-movflags", "+faststart",
-            proxy_path,
-        ],
-        "Create proxy",
-    )
+    chunks: list[ChunkSpec] = []
+    start = 0.0
+    for index in range(n):
+        end = duration if index == n - 1 else start + L
+        chunks.append(ChunkSpec(index, start, min(end, duration)))
+        start += step
 
-    if not os.path.isfile(proxy_path) or os.path.getsize(proxy_path) == 0:
-        raise AnalysisError("Proxy file was not created or is empty.")
-
-    orig_mb  = os.path.getsize(input_path)  / (1024 * 1024)
-    proxy_mb = os.path.getsize(proxy_path) / (1024 * 1024)
-    logging.info("General proxy ready: %.1f MB → %.1f MB", orig_mb, proxy_mb)
-
-    orig_dur  = probe_duration(input_path)
-    proxy_dur = probe_duration(proxy_path)
-    if abs(proxy_dur - orig_dur) > 5.0:
-        raise AnalysisError(
-            f"Proxy duration ({proxy_dur:.1f}s) differs from original "
-            f"({orig_dur:.1f}s) by more than 5 s. "
-            "FFmpeg may have truncated the file — check disk space."
-        )
-
-    logging.info(
-        "Proxy duration verified: %.1f s (original: %.1f s)", proxy_dur, orig_dur
-    )
-    return proxy_path
-
-
-def create_goal_proxy(input_path: str, proxy_path: str) -> str:
-    """
-    Create a higher-quality, higher-FPS proxy specifically for goal detection.
-
-    Higher FPS (12) ensures the exact frame where the ball crosses the line or
-    the net billows is captured.  Wider resolution (640px) makes scoreboard
-    digits and player celebrations easier for the model to recognise.
-
-    The proxy still covers the FULL match so timestamps stay valid.
-    """
-    if not _get_bool_env("ANALYZE_USE_PROXY", True):
-        logging.info("Goal proxy disabled — using original video for goal pass.")
-        return input_path
-
-    ensure_ffmpeg()
-
-    width = _get_int_env("ANALYZE_GOAL_PROXY_WIDTH", DEFAULT_GOAL_PROXY_WIDTH)
-    fps   = _get_int_env("ANALYZE_GOAL_PROXY_FPS",   DEFAULT_GOAL_PROXY_FPS)
-    crf   = _get_int_env("ANALYZE_GOAL_PROXY_CRF",   DEFAULT_GOAL_PROXY_CRF)
-
-    if os.path.isfile(proxy_path):
-        os.remove(proxy_path)
-
-    logging.info("Creating goal proxy: %spx, %sfps, CRF %s …", width, fps, crf)
-
-    run_command(
-        [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", f"scale={width}:-2,fps={fps}",
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", str(crf),
-            "-movflags", "+faststart",
-            proxy_path,
-        ],
-        "Create goal proxy",
-    )
-
-    if not os.path.isfile(proxy_path) or os.path.getsize(proxy_path) == 0:
-        raise AnalysisError("Goal proxy file was not created or is empty.")
-
-    orig_mb  = os.path.getsize(input_path)  / (1024 * 1024)
-    proxy_mb = os.path.getsize(proxy_path) / (1024 * 1024)
-    logging.info("Goal proxy ready: %.1f MB → %.1f MB", orig_mb, proxy_mb)
-
-    orig_dur  = probe_duration(input_path)
-    proxy_dur = probe_duration(proxy_path)
-    if abs(proxy_dur - orig_dur) > 5.0:
-        raise AnalysisError(
-            f"Goal proxy duration ({proxy_dur:.1f}s) differs from original "
-            f"({orig_dur:.1f}s) by more than 5 s."
-        )
-
-    logging.info(
-        "Goal proxy duration verified: %.1f s (original: %.1f s)", proxy_dur, orig_dur
-    )
-    return proxy_path
-
-
-def cleanup_proxies(*paths: str) -> None:
-    for path in paths:
-        if path and os.path.isfile(path):
-            try:
-                os.remove(path)
-            except Exception as exc:
-                logging.warning("Could not delete proxy %s: %s", path, exc)
+    return chunks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Prompts
+# Burned-in timecode overlay
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_goal_detection_prompt(video_duration: float, attempt: int = 0) -> str:
-    """
-    Highly focused prompt for the goals-only first pass.
+def _resolve_font() -> str | None:
+    if os.path.isfile(BUNDLED_FONT):
+        return BUNDLED_FONT
+    logging.warning(
+        "Bundled font not found at %s — burned-in timecode will be disabled.",
+        BUNDLED_FONT,
+    )
+    return None
 
-    We tell the model EXACTLY what visual signals indicate a goal and ask it
-    to timestamp the FIRST clear visual indicator (ball fully past the line /
-    net moving), not the shot or the run-up.
+
+def _escape_ffmpeg_path(path: str) -> str:
+    """Escape a filesystem path for safe use inside an ffmpeg filtergraph
+    option value (colons separate filter options, so 'C:\\...' on Windows
+    must become 'C\\:/...')."""
+    p = path.replace("\\", "/")
+    p = p.replace(":", "\\:")
+    return p
+
+
+def _drawtext_filter(font_path: str) -> str:
+    escaped = _escape_ffmpeg_path(os.path.abspath(font_path))
+    return (
+        f"drawtext=fontfile='{escaped}':"
+        "text='%{pts\\:hms}':"
+        "x=24:y=24:fontsize=40:fontcolor=white:"
+        "box=1:boxcolor=black@0.55:boxborderw=12"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chunk proxy creation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_chunk_proxy(
+    input_path: str,
+    chunk: ChunkSpec,
+    out_path: str,
+    font_path: str | None,
+) -> None:
     """
-    minutes        = video_duration / 60.0
-    min_last_event = max(0.0, video_duration - 600)
+    Cut+re-encode a single chunk of the match, starting its own timeline at 0.
+    -ss placed BEFORE -i is fast-seek, but ffmpeg performs accurate
+    (frame-exact) seeking automatically whenever the output is re-encoded, so
+    the chunk boundaries stay precise.
+    """
+    ensure_ffmpeg()
+
+    width = _get_int_env("ANALYZE_CHUNK_PROXY_WIDTH", DEFAULT_CHUNK_PROXY_WIDTH)
+    fps   = _get_int_env("ANALYZE_CHUNK_PROXY_FPS",   DEFAULT_CHUNK_PROXY_FPS)
+    crf   = _get_int_env("ANALYZE_CHUNK_PROXY_CRF",   DEFAULT_CHUNK_PROXY_CRF)
+    burn  = _get_bool_env("ANALYZE_BURN_TIMECODE", True)
+
+    vf = f"scale={width}:-2,fps={fps}"
+    if burn and font_path:
+        vf += "," + _drawtext_filter(font_path)
+
+    if os.path.isfile(out_path):
+        os.remove(out_path)
+
+    keep_audio = _get_bool_env("ANALYZE_KEEP_AUDIO", True)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{chunk.start:.3f}",
+        "-i", input_path,
+        "-t", f"{chunk.duration:.3f}",
+        "-vf", vf,
+    ]
+    if keep_audio:
+        # KEEP AUDIO. Gemini processes audio and video as separate streams —
+        # stripping audio (previously "-an") throws away the crowd-roar
+        # spike and commentator reaction, which are often the single
+        # clearest signal that a goal just happened. Downmix to mono/low
+        # bitrate since we only need it as a corroborating cue, not for
+        # playback quality.
+        cmd += ["-c:a", "aac", "-ac", "1", "-b:a", "64k"]
+    else:
+        cmd += ["-an"]
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", str(crf),
+        "-movflags", "+faststart",
+        out_path,
+    ]
+
+    run_command(cmd, f"Create chunk {chunk.index} proxy")
+
+    if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        raise AnalysisError(f"Chunk {chunk.index} proxy was not created or is empty.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Prompts (chunk-relative)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_goal_detection_prompt(chunk_duration: float, attempt: int = 0) -> str:
     retry_note = ""
     if attempt > 0:
         retry_note = (
             f"\n\nRETRY {attempt}: Previous response was rejected. "
-            "Re-examine the full video. Report every goal you can find. "
-            f"If goals exist in the second half (after {video_duration/2:.0f} s), "
-            "you MUST include them."
+            "Re-watch the ENTIRE clip from 0:00 to the end and re-check the "
+            "burned-in clock before answering."
         )
 
     return f"""You are a specialist football goal-detection system.
-Watch this COMPLETE football match video (duration: {video_duration:.1f} s / {minutes:.1f} min)
-from the very first second to the final whistle.
+This is a SHORT CLIP cut from a longer match. It is {chunk_duration:.1f} seconds
+long. Watch it from the very first frame to the last.
 
-YOUR ONLY TASK: Find every goal scored in this match and return its precise timestamp.
+A running on-screen clock is burned into the TOP-LEFT corner of the video,
+format HH:MM:SS, showing the exact elapsed time WITHIN THIS CLIP (it starts
+at 00:00:00 at the first frame). Read the clock directly rather than
+estimating time from pacing or context -- it is ground truth.
+
+YOUR ONLY TASK: Find every goal scored in THIS CLIP and report its precise
+timestamp in seconds from the START OF THIS CLIP (0 to {chunk_duration:.0f}).
+It is completely fine to return an empty "goals" list if no goal occurs here.
 
 ════════════════════════════════════════════════════════════════
-HOW TO IDENTIFY A GOAL (visual cues — look for ALL of these)
+HOW TO IDENTIFY A GOAL (use BOTH audio and visual cues)
 ════════════════════════════════════════════════════════════════
-1. NET MOVEMENT — the net at the back of the goal bulges, shakes, or ripples
-   as a result of a ball strike. This is the PRIMARY cue.
-2. BALL POSITION — the ball is clearly inside or passing through the goal frame.
+This clip has audio. Listen to it as carefully as you watch the video —
+a sudden crowd roar or the commentator's excited reaction (e.g. shouting
+the scorer's name, "GOAL", a pitch/volume spike) is often the clearest,
+fastest signal that a goal just happened, and should raise your confidence
+even if the exact instant the ball crosses the line is briefly obscured by
+a camera cut or replay.
+
+VISUAL cues:
+1. NET MOVEMENT — the net bulges, shakes, or ripples from a ball strike.
+   This is the PRIMARY visual cue.
+2. BALL POSITION — the ball is clearly inside or passing through the goal.
 3. SCOREBOARD / SCORE GRAPHIC — the on-screen score increments by 1.
 4. REFEREE GESTURE — the referee points to the centre circle.
-5. PLAYER CELEBRATION — the goal scorer and team-mates immediately celebrate
-   (arms raised, running, hugging). This confirms a goal just scored.
-6. CROWD REACTION — sudden loud crowd eruption synchronised with net movement.
+5. PLAYER CELEBRATION — scorer and team-mates immediately celebrate.
+6. CROWD REACTION (visual) — sudden crowd eruption synchronised with net movement.
+
+AUDIO cues:
+7. CROWD ROAR — a sudden, sustained volume spike in crowd noise.
+8. COMMENTATOR REACTION — excited tone, raised pitch/volume, or the
+   scorer's name being called out immediately after a shot.
+
+A goal is confirmed when visual and audio cues agree. If audio strongly
+suggests a goal but the ball-crossing-the-line moment itself is not
+clearly visible (e.g. blocked by players, quick cut to celebration),
+still report it — set the timestamp to the moment the net moves or the
+shot is struck (whichever is visible) and lower confidence accordingly
+rather than omitting the goal entirely.
 
 ════════════════════════════════════════════════════════════════
 TIMESTAMP ACCURACY — CRITICAL
 ════════════════════════════════════════════════════════════════
-• rough_timestamp = the EXACT second in the VIDEO FILE when the ball is
-  FULLY PAST the goal line (net first moves / ball inside net).
-  Do NOT timestamp the shot, the run-up, or the celebration start.
-• Be precise to the nearest second. If unsure between two frames, pick the
-  earlier one (when the net first visibly moves).
-• Scan BOTH halves completely. The second half starts around {video_duration/2:.0f} s.
-• The latest goal timestamp MUST be ≥ {min_last_event:.0f} s if a goal occurs
-  in the final 10 minutes.
+• rough_timestamp = the value read off the burned-in clock at the moment the
+  ball is FULLY PAST the goal line (net first moves / ball inside net).
+• Do NOT timestamp the shot, the run-up, or the celebration start.
+• Cross-check your answer against the on-screen clock -- do not guess.
 
 ════════════════════════════════════════════════════════════════
 OUTPUT FORMAT — return ONLY valid JSON, no markdown, no commentary
@@ -432,7 +562,7 @@ OUTPUT FORMAT — return ONLY valid JSON, no markdown, no commentary
 {{
   "goals": [
     {{
-      "rough_timestamp": 1234.5,
+      "rough_timestamp": 123.5,
       "confidence": 0.95,
       "description": "Left-footed shot, net bulges bottom-right, score graphic updates to 1-0"
     }}
@@ -440,41 +570,39 @@ OUTPUT FORMAT — return ONLY valid JSON, no markdown, no commentary
 }}{retry_note}"""
 
 
-def build_prompt(video_duration: float, attempt: int = 0) -> str:
-    """General highlights prompt (Pass 2)."""
-    minutes        = video_duration / 60.0
-    expected       = max(30, int(minutes * 1.5))
-    min_last_event = max(0.0, video_duration - 600)
+def build_prompt(chunk_duration: float, attempt: int = 0) -> str:
+    """General highlights prompt, chunk-relative."""
+    expected_hint = max(1, round(chunk_duration / 60 * 1.2))
     retry_note = ""
     if attempt > 0:
         retry_note = (
-            f"\n\nRETRY {attempt}: Previous response was rejected. "
-            f"Return at least {expected} events. "
-            f"The latest rough_timestamp MUST be ≥ {min_last_event:.0f} s. "
-            "Use ONLY the event types listed below — no others."
+            f"\n\nRETRY {attempt}: Previous response was invalid or empty JSON. "
+            "Re-check the burned-in clock and re-submit using ONLY the event "
+            "types listed below."
         )
 
     valid_list = " | ".join(sorted(VALID_TYPES))
 
-    return f"""You are an expert football video analyst. Watch this COMPLETE football match
-video from the very first second to the final whistle and identify every
-highlight-worthy moment for a 15-minute reel.
+    return f"""You are an expert football video analyst. Watch this SHORT CLIP
+({chunk_duration:.1f} seconds, cut from a longer match) from its first frame
+to its last and identify every highlight-worthy moment for a TV-style reel.
 
-VIDEO DURATION: {video_duration:.1f} s ({minutes:.1f} min)
+A running on-screen clock is burned into the TOP-LEFT corner, format
+HH:MM:SS, showing elapsed time WITHIN THIS CLIP (starts at 00:00:00 at the
+first frame). Read timestamps directly off this clock.
 
 ════════════════════════════════════════════════════════════════
-COVERAGE — NON-NEGOTIABLE
+COVERAGE
 ════════════════════════════════════════════════════════════════
-• Scan every single minute from 0:00 to {minutes:.0f}:00.
-• Include moments from BOTH halves of the match.
-• Your last rough_timestamp MUST be ≥ {min_last_event:.0f} s
-  (i.e. within the final 10 minutes of the match).
-• Return at least {expected} events total.
-• Average gap between consecutive events ≤ 90 s.
-• Do not leave any 10-minute match segment empty when there is visible play.
-• IMPORTANT: Goals will be supplied to you from a dedicated goal-detection pass.
-  You do NOT need to find goals — focus on all other event types.
-  If you do see an obvious goal, still report it — but do not worry if you miss one.
+• Scan the entire clip, start to finish.
+• Roughly {expected_hint} or more events is typical for a clip this length if
+  the play is active — but report what is ACTUALLY there. A quiet clip
+  (e.g. midfield build-up with no shots) can legitimately have very few
+  events. Never invent events to hit a quota.
+• IMPORTANT: Goals are supplied by a dedicated goal-detection pass over this
+  same clip. You do NOT need to find goals — focus on all other event types.
+  If you do see an obvious goal, still report it; the pipeline will
+  de-duplicate it against the goal pass automatically.
 
 ════════════════════════════════════════════════════════════════
 ALLOWED EVENT TYPES — use EXACTLY these strings, nothing else
@@ -494,20 +622,21 @@ LOW PRIORITY (include when clearly visible):
 ════════════════════════════════════════════════════════════════
 ACCURACY RULES
 ════════════════════════════════════════════════════════════════
-• rough_timestamp = seconds from the very start of the video file.
+• rough_timestamp = seconds from the start of THIS CLIP, read off the
+  burned-in clock — not your own sense of pacing.
 • Timestamp the START of the action (shot struck, not net bulging).
 • confidence: 0.85-1.00 clearly visible · 0.60-0.84 probable
 • Do NOT invent events. Only report what is visually present.
 • Do NOT list the same play twice under different labels.
-• If goal + celebration are one sequence, report the celebration only
-  (goals come from the dedicated pass and will be merged in).
+• If goal + celebration are one sequence, report the celebration only.
 
-Return ONLY valid JSON — no markdown fences, no commentary:
+Return ONLY valid JSON — no markdown fences, no commentary. An empty
+"events" list is a valid answer for a quiet clip:
 {{
   "events": [
     {{
       "type": "one of the allowed types above",
-      "rough_timestamp": 154.2,
+      "rough_timestamp": 54.2,
       "confidence": 0.94,
       "description": "short description"
     }}
@@ -516,7 +645,7 @@ Return ONLY valid JSON — no markdown fences, no commentary:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Response parsing & validation
+# Response parsing & validation (chunk-relative bounds)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_json(text: str) -> str:
@@ -546,19 +675,14 @@ def _resolve_type(raw: str) -> str | None:
         return t
     mapped = TYPE_ALIASES.get(t)
     if mapped:
-        logging.info("Mapped unknown type '%s' → '%s'", raw, mapped)
+        logging.info("Mapped unknown type '%s' -> '%s'", raw, mapped)
         return mapped
     logging.warning("Dropping unknown event type '%s'", raw)
     return None
 
 
-def parse_goals_response(response_text: str, video_duration: float) -> list[dict[str, Any]]:
-    """
-    Parse the goals-only first-pass response.
-    Returns a list of normalised goal events (type always = "goal").
-    Raises AnalysisError only on structural failures; an empty list is OK
-    (the match may be 0-0).
-    """
+def parse_goals_response(response_text: str, chunk_duration: float) -> list[dict[str, Any]]:
+    """Parse the goals-only pass for one chunk. Empty list is a valid result."""
     try:
         payload = json.loads(_extract_json(response_text))
     except json.JSONDecodeError as exc:
@@ -569,17 +693,16 @@ def parse_goals_response(response_text: str, video_duration: float) -> list[dict
 
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
-        # Model may wrap under "events" fallback
         raw_goals = payload.get("events", [])
+        if not isinstance(raw_goals, list):
+            raise AnalysisError("'goals' array is missing.")
 
     goals: list[dict[str, Any]] = []
     for i, item in enumerate(raw_goals, start=1):
         if not isinstance(item, dict):
             continue
-        # Accept both the goals-pass format and the events-pass format
         raw_type = str(item.get("type", "goal"))
         canonical = _resolve_type(raw_type)
-        # Only keep goals (and aliases that map to goal)
         if canonical != "goal":
             continue
         try:
@@ -589,29 +712,29 @@ def parse_goals_response(response_text: str, video_duration: float) -> list[dict
             continue
         if ts < 0:
             ts = 0.0
-        if ts > video_duration + 60:
+        if ts > chunk_duration + 15:
             logging.warning(
-                "Goal #%d timestamp %.1f s exceeds video duration %.1f s — skipping.",
-                i, ts, video_duration,
+                "Goal #%d timestamp %.1f s exceeds chunk duration %.1f s — skipping.",
+                i, ts, chunk_duration,
             )
             continue
+        ts = min(ts, chunk_duration)
         goals.append(
             {
                 "type":            "goal",
                 "rough_timestamp": round(ts, 3),
                 "confidence":      round(_normalize_confidence(item.get("confidence")), 3),
                 "description":     str(item.get("description", "")).strip(),
-                "_source":         "goal_pass",   # internal tag, stripped before output
+                "_source":         "goal_pass",
             }
         )
 
     goals.sort(key=lambda e: e["rough_timestamp"])
-    logging.info("Goal pass returned %d goal(s).", len(goals))
     return goals
 
 
-def parse_and_validate(response_text: str, video_duration: float) -> dict[str, Any]:
-    """Parse JSON from general-highlights pass, normalise types, enforce coverage."""
+def parse_and_validate(response_text: str, chunk_duration: float) -> dict[str, Any]:
+    """Parse JSON from the general-highlights pass for one chunk."""
     try:
         payload = json.loads(_extract_json(response_text))
     except json.JSONDecodeError as exc:
@@ -621,8 +744,8 @@ def parse_and_validate(response_text: str, video_duration: float) -> dict[str, A
         raise AnalysisError("JSON root is not an object.")
 
     raw_events = payload.get("events")
-    if not isinstance(raw_events, list) or not raw_events:
-        raise AnalysisError("'events' array is missing or empty.")
+    if not isinstance(raw_events, list):
+        raise AnalysisError("'events' array is missing.")
 
     events: list[dict[str, Any]] = []
     for i, item in enumerate(raw_events, start=1):
@@ -639,6 +762,7 @@ def parse_and_validate(response_text: str, video_duration: float) -> dict[str, A
             raise AnalysisError(f"Event #{i} has invalid rough_timestamp.")
         if ts < 0:
             ts = 0.0
+        ts = min(ts, chunk_duration + 15)
 
         events.append(
             {
@@ -649,78 +773,21 @@ def parse_and_validate(response_text: str, video_duration: float) -> dict[str, A
             }
         )
 
-    if not events:
-        raise AnalysisError("No valid events after type normalisation.")
-
     events.sort(key=lambda e: e["rough_timestamp"])
-
-    # ── Coverage check ────────────────────────────────────────────────────────
-    if video_duration > MIN_COVERAGE_BYPASS_SECS:
-        latest_ts      = max(e["rough_timestamp"] for e in events)
-        coverage_ratio = latest_ts / video_duration
-
-        if coverage_ratio < MIN_COVERAGE_RATIO:
-            raise AnalysisError(
-                f"Coverage too low: latest event at {latest_ts:.0f} s "
-                f"({latest_ts/60:.1f} min) = {coverage_ratio*100:.0f}% of match "
-                f"({video_duration/60:.1f} min). Need ≥ {MIN_COVERAGE_RATIO*100:.0f}%."
-            )
-
-        segment_seconds = _get_int_env("COVERAGE_SEGMENT_SECONDS", 600)
-        segment_count = max(1, int((video_duration + segment_seconds - 1) // segment_seconds))
-        occupied_segments = {
-            min(segment_count - 1, int(e["rough_timestamp"] // segment_seconds))
-            for e in events
-        }
-        required_segments = max(2, int(segment_count * MIN_SEGMENT_COVERAGE_RATIO + 0.999))
-        if len(occupied_segments) < required_segments:
-            raise AnalysisError(
-                "Coverage too clustered: "
-                f"events appear in {len(occupied_segments)}/{segment_count} timeline segments. "
-                f"Need at least {required_segments}."
-            )
-
-        gaps = [
-            events[index + 1]["rough_timestamp"] - events[index]["rough_timestamp"]
-            for index in range(len(events) - 1)
-        ]
-        max_gap = max(gaps) if gaps else 0.0
-        allowed_gap = float(os.getenv("MAX_EVENT_GAP_SECONDS", str(MAX_EVENT_GAP_SECONDS)))
-        if max_gap > allowed_gap:
-            raise AnalysisError(
-                "Coverage has a large empty gap: "
-                f"largest gap is {max_gap / 60:.1f} min."
-            )
-
-        logging.info(
-            "Coverage OK — latest event %.0f s (%.1f min), %.0f%% of match.",
-            latest_ts, latest_ts / 60, coverage_ratio * 100,
-        )
-
+    # An empty list is a legitimate answer for a quiet chunk — not an error.
     return {"events": events}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Goal merge logic
+# Goal merge (within a single chunk) + cross-chunk de-duplication
 # ══════════════════════════════════════════════════════════════════════════════
 
 def merge_goals_into_events(
     goal_pass_goals: list[dict[str, Any]],
     general_events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """
-    Combine goals from the dedicated goal pass with the general highlights.
-
-    Strategy:
-    1. Remove any "goal" events from the general pass that are within
-       GOAL_MERGE_WINDOW_SECONDS of a goal-pass goal (goal-pass is authoritative
-       for timestamp accuracy).
-    2. Inject all goal-pass goals into the combined list.
-    3. Sort by timestamp.
-    4. Strip internal "_source" tag.
-    """
-    window = float(os.getenv("GOAL_MERGE_WINDOW_SECONDS", str(GOAL_MERGE_WINDOW_SECONDS)))
-
+    """Goal-pass goals are authoritative for timestamp accuracy within a chunk."""
+    window = GOAL_MERGE_WINDOW_SECONDS
     goal_timestamps = [g["rough_timestamp"] for g in goal_pass_goals]
 
     def _near_goal_pass(event: dict[str, Any]) -> bool:
@@ -728,21 +795,53 @@ def merge_goals_into_events(
             return False
         return any(abs(event["rough_timestamp"] - gt) <= window for gt in goal_timestamps)
 
-    # Keep general events that are NOT duplicate goals
     filtered = [e for e in general_events if not _near_goal_pass(e)]
-
     merged = filtered + goal_pass_goals
     merged.sort(key=lambda e: e["rough_timestamp"])
-
-    # Strip internal tag
     for event in merged:
         event.pop("_source", None)
-
-    logging.info(
-        "Merge: %d goal-pass goals + %d general events → %d total events",
-        len(goal_pass_goals), len(filtered), len(merged),
-    )
     return merged
+
+
+def dedupe_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Collapse duplicate events that appear in the overlap region between two
+    adjacent chunks. Events are already in absolute match-time seconds here.
+
+    Same-chunk events are NEVER merged, even if close in time: the model
+    already reported them as two separate things in one call, so collapsing
+    them on timestamp-proximity alone risks silently dropping a real event
+    (e.g. two genuinely distinct goals scored within the merge window of
+    each other). Only cross-chunk pairs — the actual overlap-region
+    duplicates this function exists to clean up — are candidates for merge.
+    """
+    events = sorted(events, key=lambda e: e["rough_timestamp"])
+    deduped: list[dict[str, Any]] = []
+
+    for event in events:
+        window = GOAL_MERGE_WINDOW_SECONDS if event["type"] == "goal" else GENERIC_MERGE_WINDOW_SECONDS
+        merged = False
+        for existing in reversed(deduped):
+            if event["rough_timestamp"] - existing["rough_timestamp"] > max(
+                GOAL_MERGE_WINDOW_SECONDS, GENERIC_MERGE_WINDOW_SECONDS
+            ):
+                break
+            if existing["type"] != event["type"]:
+                continue
+            if existing["_chunk"] == event["_chunk"]:
+                continue
+            if abs(event["rough_timestamp"] - existing["rough_timestamp"]) <= window:
+                if event["confidence"] > existing["confidence"]:
+                    existing.update(event)
+                merged = True
+                break
+        if not merged:
+            deduped.append(dict(event))
+
+    deduped.sort(key=lambda e: e["rough_timestamp"])
+    for event in deduped:
+        event.pop("_chunk", None)
+    return deduped
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,7 +904,6 @@ def _wait_for_file(client: genai.Client, uploaded_file: Any) -> Any:
             raise AnalysisError(f"File processing failed: {name}")
         if time.monotonic() > deadline:
             raise AnalysisError(f"Timed out waiting for file processing: {name}")
-        logging.info("Waiting for file processing …")
         time.sleep(POLL_SECONDS)
 
 
@@ -813,12 +911,7 @@ def _upload_with_retry(client: genai.Client, video_path: str, label: str) -> Any
     last_exc: Exception | None = None
     for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
         try:
-            logging.info(
-                "Uploading video to %s (attempt %d/%d) …",
-                label, attempt, MAX_UPLOAD_RETRIES,
-            )
             uploaded = client.files.upload(file=video_path)
-            logging.info("Upload complete — waiting for processing …")
             return _wait_for_file(client, uploaded)
         except Exception as exc:
             last_exc = exc
@@ -829,10 +922,29 @@ def _upload_with_retry(client: genai.Client, video_path: str, label: str) -> Any
     raise AnalysisError(f"{label} upload failed after {MAX_UPLOAD_RETRIES} attempts: {last_exc}")
 
 
+def _video_part(uploaded_file: Any, fps: float | None) -> Any:
+    """
+    Build the request Part explicitly so we can set video_metadata.fps.
+    Gemini's File API samples at a fixed 1 FPS by default REGARDLESS of the
+    encoded proxy's frame rate — this override is the only way to actually
+    change what the model samples.
+    """
+    file_uri  = getattr(uploaded_file, "uri", None)
+    mime_type = getattr(uploaded_file, "mime_type", None) or "video/mp4"
+    if not file_uri:
+        # Fallback for SDK versions where passing the File object directly works.
+        return uploaded_file
+    return types.Part(
+        file_data=types.FileData(file_uri=file_uri, mime_type=mime_type),
+        video_metadata=types.VideoMetadata(fps=fps) if fps else None,
+    )
+
+
 def _call_model_with_retry(
     client: genai.Client,
     model: str,
     uploaded_file: Any,
+    fps: float,
     prompt: str,
     label: str,
 ) -> Any:
@@ -841,7 +953,7 @@ def _call_model_with_retry(
         try:
             return client.models.generate_content(
                 model=model,
-                contents=[uploaded_file, prompt],
+                contents=[_video_part(uploaded_file, fps), prompt],
             )
         except Exception as exc:
             last_exc = exc
@@ -852,142 +964,163 @@ def _call_model_with_retry(
     raise AnalysisError(f"API call failed after {API_RETRIES_PER_CALL} retries: {last_exc}")
 
 
-def _run_goal_pass(
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-chunk analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_goal_pass_for_chunk(
     client: genai.Client,
     models: list[str],
-    goal_proxy_path: str,
-    video_duration: float,
+    uploaded_file: Any,
+    chunk: ChunkSpec,
     label: str,
 ) -> list[dict[str, Any]]:
-    """
-    Pass 1: Upload the goal-quality proxy and run the goals-only prompt.
-    Returns a list of goal events (may be empty for a 0-0 draw).
-    Never raises — returns [] on any failure so the pipeline continues.
-    """
-    logging.info("[%s] ── Pass 1: Goal detection ──", label)
+    goal_fps = _get_float_env("ANALYZE_GOAL_SAMPLE_FPS", DEFAULT_GOAL_SAMPLE_FPS)
+    last_error: Exception | None = None
+    for model in models:
+        for attempt in range(MAX_PROMPT_RETRIES):
+            try:
+                response = _call_model_with_retry(
+                    client, model, uploaded_file, goal_fps,
+                    build_goal_detection_prompt(chunk.duration, attempt),
+                    f"{label}/chunk{chunk.index}/Goal",
+                )
+                return parse_goals_response(response.text or "", chunk.duration)
+            except AnalysisError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                break
+    logging.warning(
+        "[%s/chunk%d/Goal] all attempts failed: %s — no goals for this chunk.",
+        label, chunk.index, last_error,
+    )
+    return []
+
+
+def _run_general_pass_for_chunk(
+    client: genai.Client,
+    models: list[str],
+    uploaded_file: Any,
+    chunk: ChunkSpec,
+    label: str,
+) -> list[dict[str, Any]]:
+    general_fps = _get_float_env("ANALYZE_GENERAL_SAMPLE_FPS", DEFAULT_GENERAL_SAMPLE_FPS)
+    last_error: Exception | None = None
+    for model in models:
+        for attempt in range(MAX_PROMPT_RETRIES):
+            try:
+                response = _call_model_with_retry(
+                    client, model, uploaded_file, general_fps,
+                    build_prompt(chunk.duration, attempt),
+                    f"{label}/chunk{chunk.index}",
+                )
+                return parse_and_validate(response.text or "", chunk.duration)["events"]
+            except AnalysisError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                break
+    logging.warning(
+        "[%s/chunk%d] all attempts failed: %s — skipping general events for this chunk.",
+        label, chunk.index, last_error,
+    )
+    return []
+
+
+def _process_chunk(
+    client: genai.Client,
+    models: list[str],
+    input_video_path: str,
+    chunk: ChunkSpec,
+    work_dir: str,
+    font_path: str | None,
+    label: str,
+) -> list[dict[str, Any]]:
+    logging.info(
+        "[%s] ── Chunk %d: %.0fs-%.0fs (%.0fs) ──",
+        label, chunk.index, chunk.start, chunk.end, chunk.duration,
+    )
+
+    proxy_path = os.path.join(work_dir, f"chunk_{chunk.index:03d}.mp4")
+    create_chunk_proxy(input_video_path, chunk, proxy_path, font_path)
+
     uploaded_file: Any = None
     try:
-        uploaded_file = _upload_with_retry(client, goal_proxy_path, f"{label}/GoalProxy")
-        last_error: Exception | None = None
+        uploaded_file = _upload_with_retry(client, proxy_path, f"{label}/chunk{chunk.index}")
 
-        for model in models:
-            for attempt in range(MAX_PROMPT_RETRIES):
-                try:
-                    logging.info(
-                        "[%s/GoalPass] model=%s attempt=%d/%d",
-                        label, model, attempt + 1, MAX_PROMPT_RETRIES,
-                    )
-                    response = _call_model_with_retry(
-                        client, model, uploaded_file,
-                        build_goal_detection_prompt(video_duration, attempt),
-                        f"{label}/GoalPass",
-                    )
-                    goals = parse_goals_response(response.text or "", video_duration)
-                    logging.info(
-                        "[%s/GoalPass] accepted: %d goal(s)", label, len(goals)
-                    )
-                    return goals
-                except AnalysisError as exc:
-                    last_error = exc
-                    logging.warning(
-                        "[%s/GoalPass] attempt %d/%d rejected: %s",
-                        label, attempt + 1, MAX_PROMPT_RETRIES, exc,
-                    )
-                except Exception as exc:
-                    last_error = exc
-                    logging.warning("[%s/GoalPass] model %s error: %s", label, model, exc)
-                    break
+        goal_events    = _run_goal_pass_for_chunk(client, models, uploaded_file, chunk, label)
+        general_events = _run_general_pass_for_chunk(client, models, uploaded_file, chunk, label)
+        merged = merge_goals_into_events(goal_events, general_events)
 
-        logging.warning("[%s/GoalPass] all attempts failed: %s — continuing without goal pass.", label, last_error)
-        return []
+        for event in merged:
+            event["rough_timestamp"] = round(event["rough_timestamp"] + chunk.start, 3)
+            event["_chunk"] = chunk.index
 
-    except Exception as exc:
-        logging.warning("[%s/GoalPass] upload/setup failed: %s — skipping goal pass.", label, exc)
-        return []
+        logging.info(
+            "[%s/chunk%d] %d event(s) (%d goal(s))",
+            label, chunk.index, len(merged),
+            sum(1 for e in merged if e["type"] == "goal"),
+        )
+        return merged
     finally:
         if uploaded_file is not None:
             try:
                 client.files.delete(name=uploaded_file.name)
-                logging.info("[%s/GoalPass] Deleted uploaded goal proxy.", label)
             except Exception as exc:
-                logging.warning("[%s/GoalPass] Could not delete goal proxy file: %s", label, exc)
+                logging.warning("[%s/chunk%d] Could not delete uploaded file: %s", label, chunk.index, exc)
+        if os.path.isfile(proxy_path):
+            try:
+                os.remove(proxy_path)
+            except Exception as exc:
+                logging.warning("[%s/chunk%d] Could not delete chunk proxy: %s", label, chunk.index, exc)
 
 
 def _run_genai_analysis(
     client: genai.Client,
     models: list[str],
-    video_path: str,
-    goal_proxy_path: str,
+    input_video_path: str,
     video_duration: float,
     label: str,
 ) -> dict[str, Any]:
-    """
-    Two-pass analysis:
-      Pass 1 — Upload goal proxy, run goal-detection prompt → list of goals.
-      Pass 2 — Upload general proxy, run highlights prompt → full event list.
-    Goals from Pass 1 are merged over Pass 2 goals.
-    """
-    # ── Pass 1: Goals ─────────────────────────────────────────────────────────
-    goal_events = _run_goal_pass(client, models, goal_proxy_path, video_duration, label)
+    chunk_seconds    = _get_int_env("ANALYZE_CHUNK_SECONDS", DEFAULT_CHUNK_SECONDS)
+    overlap_seconds  = _get_int_env("ANALYZE_CHUNK_OVERLAP_SECONDS", DEFAULT_CHUNK_OVERLAP_SECONDS)
+    chunks = compute_chunks(video_duration, chunk_seconds, overlap_seconds)
+    logging.info(
+        "[%s] Split %.0fs match into %d chunk(s) of ~%ds (overlap %ds).",
+        label, video_duration, len(chunks), chunk_seconds, overlap_seconds,
+    )
 
-    # ── Pass 2: General highlights ────────────────────────────────────────────
-    logging.info("[%s] ── Pass 2: General highlights ──", label)
-    uploaded_file = _upload_with_retry(client, video_path, label)
-    last_error: Exception | None = None
+    font_path = _resolve_font()
+    work_dir = os.path.join(CHUNK_WORKDIR, label.lower())
+    os.makedirs(work_dir, exist_ok=True)
 
+    all_events: list[dict[str, Any]] = []
     try:
-        for model in models:
-            for attempt in range(MAX_PROMPT_RETRIES):
-                try:
-                    logging.info(
-                        "[%s] model=%s prompt-attempt=%d/%d",
-                        label, model, attempt + 1, MAX_PROMPT_RETRIES,
-                    )
-                    response = _call_model_with_retry(
-                        client, model, uploaded_file,
-                        build_prompt(video_duration, attempt),
-                        label,
-                    )
-                    parsed = parse_and_validate(response.text or "", video_duration)
-                    logging.info(
-                        "[%s] accepted: %d general events", label, len(parsed["events"])
-                    )
-
-                    # ── Merge goal-pass goals into general events ──────────────
-                    merged_events = merge_goals_into_events(
-                        goal_events, parsed["events"]
-                    )
-                    return {"events": merged_events}
-
-                except AnalysisError as exc:
-                    last_error = exc
-                    logging.warning(
-                        "[%s] prompt attempt %d/%d rejected: %s",
-                        label, attempt + 1, MAX_PROMPT_RETRIES, exc,
-                    )
-                except Exception as exc:
-                    last_error = exc
-                    logging.warning("[%s] model %s error: %s", label, model, exc)
-                    break
+        for chunk in chunks:
+            chunk_events = _process_chunk(
+                client, models, input_video_path, chunk, work_dir, font_path, label
+            )
+            all_events.extend(chunk_events)
     finally:
-        try:
-            client.files.delete(name=uploaded_file.name)
-            logging.info("[%s] Deleted uploaded general proxy.", label)
-        except Exception as exc:
-            logging.warning("[%s] Could not delete uploaded file: %s", label, exc)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
-    raise AnalysisError(f"[{label}] all models/retries exhausted: {last_error}")
+    if not all_events:
+        raise AnalysisError(f"[{label}] No events found in any chunk.")
+
+    deduped = dedupe_events(all_events)
+    logging.info(
+        "[%s] %d raw events across all chunks -> %d after de-duplication.",
+        label, len(all_events), len(deduped),
+    )
+    return {"events": deduped}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Provider: Gemini
 # ══════════════════════════════════════════════════════════════════════════════
 
-def try_gemini(
-    video_path: str,
-    goal_proxy_path: str,
-    video_duration: float,
-) -> dict[str, Any] | None:
+def try_gemini(input_video_path: str, video_duration: float) -> dict[str, Any] | None:
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
         logging.info("GEMINI_API_KEY not set — skipping Gemini.")
@@ -995,8 +1128,7 @@ def try_gemini(
     try:
         client = genai.Client(api_key=key)
         return _run_genai_analysis(
-            client, get_model_candidates(),
-            video_path, goal_proxy_path, video_duration, "Gemini",
+            client, get_model_candidates(), input_video_path, video_duration, "Gemini",
         )
     except Exception as exc:
         logging.warning("Gemini failed: %s", exc)
@@ -1007,11 +1139,7 @@ def try_gemini(
 # Provider: Gemma
 # ══════════════════════════════════════════════════════════════════════════════
 
-def try_gemma(
-    video_path: str,
-    goal_proxy_path: str,
-    video_duration: float,
-) -> dict[str, Any] | None:
+def try_gemma(input_video_path: str, video_duration: float) -> dict[str, Any] | None:
     key = os.getenv("GEMMA_API_KEY", "").strip()
     if not key:
         logging.info("GEMMA_API_KEY not set — skipping Gemma.")
@@ -1019,8 +1147,7 @@ def try_gemma(
     try:
         client = genai.Client(api_key=key)
         return _run_genai_analysis(
-            client, get_gemma_model_candidates(),
-            video_path, goal_proxy_path, video_duration, "Gemma",
+            client, get_gemma_model_candidates(), input_video_path, video_duration, "Gemma",
         )
     except Exception as exc:
         logging.warning("Gemma failed: %s", exc)
@@ -1034,21 +1161,20 @@ def try_gemma(
 def analyze_video(video_path: str, output_path: str) -> None:
     load_api_keys()
     ensure_video_exists(video_path)
+    ensure_ffmpeg()
 
-    original_duration = probe_duration(video_path)
-    logging.info("Input video: %.1f s (%.1f min)", original_duration, original_duration / 60)
+    duration = probe_duration(video_path)
+    logging.info("Input video: %.1f s (%.1f min)", duration, duration / 60)
 
-    # Create both proxies upfront so the pipeline never uploads the original.
-    general_proxy_path = create_proxy(video_path, ANALYSIS_PROXY_VIDEO)
-    goal_proxy_path    = create_goal_proxy(video_path, GOAL_PROXY_VIDEO)
+    shutil.rmtree(CHUNK_WORKDIR, ignore_errors=True)
+    os.makedirs(CHUNK_WORKDIR, exist_ok=True)
 
     try:
         parsed: dict[str, Any] | None = None
 
-        parsed = try_gemini(general_proxy_path, goal_proxy_path, original_duration)
-
+        parsed = try_gemini(video_path, duration)
         if parsed is None:
-            parsed = try_gemma(general_proxy_path, goal_proxy_path, original_duration)
+            parsed = try_gemma(video_path, duration)
 
         if parsed is None:
             raise AnalysisError(
@@ -1066,10 +1192,8 @@ def analyze_video(video_path: str, output_path: str) -> None:
             "Done — %d events (%d goals) written to %s (latest at %.1f s / %.1f min).",
             event_count, goal_count, output_path, last_ts, last_ts / 60,
         )
-
     finally:
-        # Always clean up both proxies even on error.
-        cleanup_proxies(ANALYSIS_PROXY_VIDEO, GOAL_PROXY_VIDEO)
+        shutil.rmtree(CHUNK_WORKDIR, ignore_errors=True)
 
 
 def main() -> int:
