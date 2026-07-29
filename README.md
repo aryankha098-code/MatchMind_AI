@@ -39,7 +39,6 @@ GMAIL_APP_PASSWORD=
 NOTIFY_EMAIL=
 ```
 
-Do not include `.env` in Docker images or commits.
 
 ## Output
 
