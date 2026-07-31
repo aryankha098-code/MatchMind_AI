@@ -1,0 +1,16 @@
+.git
+.gitignore
+.agents
+.vscode
+__pycache__
+*.pyc
+.env
+.env.*
+oauth_client_secret.json
+token.json
+service_account.json
+match.mp4
+highlights.mp4
+analysis_proxy.mp4
+clips/
+*.log
