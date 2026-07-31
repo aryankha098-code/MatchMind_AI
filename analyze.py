@@ -60,9 +60,31 @@ video-understanding docs, that were actively hurting goal accuracy:
      depends on. Bumped to 960px / CRF 18.
 
   6. FLASH WAS THE DEFAULT MODEL FOR A PASS WHERE ACCURACY MATTERS MOST.
-     gemini-2.5-flash is default now gemini-2.5-pro. Flash is cheaper/faster
-     but noticeably less reliable at fine-grained visual judgment calls; the
-     goal pass is exactly the wrong place to make that trade.
+     The goal pass now tries a Pro-tier model first (see v6 below), falling
+     back through the same flash chain as the general pass only if Pro
+     fails or isn't available.
+
+── v6 changes — squeezing more accuracy out of what v5 already fixed ────────
+  7. RESOLUTION CEILING. Gemini tiles frames into 768x768 tiles regardless
+     of source resolution — past ~1536px (2x2 tiles) extra pixels stop
+     buying real detail. Proxy width bumped 960 -> 1536, the actual ceiling
+     rather than an arbitrary number.
+  8. GOAL-PASS SAMPLE FPS. 2.0 -> 5.0 fps for the goal pass only (general
+     pass stays at 1.0) — catches fast net-ripple moments 2fps could miss.
+  9. GOAL PASS MODEL SPLIT. Goal pass now tries `gemini-3.1-pro-preview`
+     first, falling back through the same flash waterfall as the general
+     pass. NOTE: Pro-tier models moved behind billing (~April 2026) — on a
+     free-tier key this call fails immediately (not a quota error) and
+     falls through automatically; the pipeline won't break, you just won't
+     get Pro-tier accuracy without billing enabled.
+ 10. DETERMINISM. temperature=0 on every call — same match in, same events
+     out, run to run. Doesn't narrow what footage the model can handle;
+     temperature only affects response consistency, not generality.
+ 11. OVERLAP WIDENED 20s -> 30s. More margin so a goal sequence near a chunk
+     boundary isn't split awkwardly across both proxies. Note this only
+     affects DETECTION — the final highlight clip is cut from the original
+     match.mp4 by generate_highlights.py using its own pre/post-roll padding
+     around the refined exact timestamp, so this never truncates output.
 """
 
 from __future__ import annotations
@@ -122,25 +144,49 @@ DEFAULT_GEMINI_FALLBACK_MODELS   = (
     "gemini-1.5-flash",
 )
 
+# Goal pass gets a Pro-tier model first — it's the one call where a wrong
+# answer costs you a missed highlight, so it's worth the extra cost/latency.
+# NOTE: as of ~April 2026 Google moved Pro models behind billing, off the
+# free tier entirely. Without billing enabled this call fails immediately
+# (not a quota error) and falls through to the flash chain below — the
+# pipeline still won't break, you just won't get the Pro-tier accuracy
+# unless billing is on. Falls back through the SAME flash chain as the
+# general pass (goal accuracy > general-event accuracy, never the reverse).
+DEFAULT_GOAL_MODEL = "gemini-3.1-pro-preview"
+
 # ── Chunking settings ──────────────────────────────────────────────────────────
 # Shorter chunks = better timestamp grounding, more API calls (cost/time).
 # 8 min with 20s overlap is a reasonable default for a ~90-100 min match.
 DEFAULT_CHUNK_SECONDS         = 480   # 8 minutes
-DEFAULT_CHUNK_OVERLAP_SECONDS = 20
+DEFAULT_CHUNK_OVERLAP_SECONDS = 30    # was 20 — more margin so a goal near a
+                                       # chunk boundary isn't split awkwardly
+                                       # across both proxies
 
 # ── Chunk proxy encoding (shared by both goal + general passes) ───────────────
 # 640px/CRF23 was too lossy to reliably show net movement / ball-across-line
 # on far-side action — bumped resolution up and CRF down. This costs more
 # upload bandwidth and slightly more inference time, but the proxy is what
 # the model actually sees, so it directly gates detection accuracy.
-DEFAULT_CHUNK_PROXY_WIDTH = 960   # px — legible net/ball detail + scoreboard
+# Gemini tiles frames into 768x768 tiles regardless of source resolution —
+# past 2 tiles wide (~1536px) extra pixels stop buying real detail for
+# broadcast-style footage. 1536 is the actual ceiling, not an arbitrary bump.
+DEFAULT_CHUNK_PROXY_WIDTH = 1536  # px — at the real Gemini tiling ceiling
 DEFAULT_CHUNK_PROXY_FPS   = 15    # encoded fps (smooth burned-in clock text)
 DEFAULT_CHUNK_PROXY_CRF   = 18    # lower = higher quality (23 was too lossy)
 
 # ── Gemini internal sampling rate (THIS is what actually controls what the
 #    model sees — independent of the encoded proxy fps above). ────────────────
-DEFAULT_GOAL_SAMPLE_FPS    = 2.0   # denser sampling for the short goal pass
+DEFAULT_GOAL_SAMPLE_FPS    = 5.0   # was 2.0 — catches fast net-ripple moments
 DEFAULT_GENERAL_SAMPLE_FPS = 1.0   # Gemini's own default, set explicitly anyway
+
+# Deterministic output: same match in -> same events out, run to run.
+# (Does not narrow what kind of football footage the model can handle —
+# temperature only affects response consistency, not generality.)
+DEFAULT_TEMPERATURE = 0.0
+
+# Per-part media resolution for the goal pass only (Gemini 3 models only —
+# gated by model name in _video_part; older fallback models silently skip it).
+GOAL_MEDIA_RESOLUTION = types.MediaResolution.MEDIA_RESOLUTION_HIGH
 
 # ── De-duplication across overlapping chunk boundaries ─────────────────────────
 GOAL_MERGE_WINDOW_SECONDS    = 20   # goals within this gap = same event
@@ -284,6 +330,15 @@ def get_gemma_model_candidates() -> list[str]:
             return models
     primary = os.getenv("GEMMA_MODEL", DEFAULT_GEMMA_MODEL).strip() or DEFAULT_GEMMA_MODEL
     return [primary]
+
+
+def get_goal_model_candidates() -> list[str]:
+    """Goal pass: try the Pro model first, then fall back through the same
+    flash waterfall the general pass uses. Reuses get_model_candidates()
+    instead of maintaining a second parallel list."""
+    goal_model = os.getenv("GEMINI_GOAL_MODEL", DEFAULT_GOAL_MODEL).strip() or DEFAULT_GOAL_MODEL
+    rest = [m for m in get_model_candidates() if m != goal_model]
+    return [goal_model] + rest
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -922,12 +977,15 @@ def _upload_with_retry(client: genai.Client, video_path: str, label: str) -> Any
     raise AnalysisError(f"{label} upload failed after {MAX_UPLOAD_RETRIES} attempts: {last_exc}")
 
 
-def _video_part(uploaded_file: Any, fps: float | None) -> Any:
+def _video_part(uploaded_file: Any, fps: float | None, media_resolution: Any = None) -> Any:
     """
     Build the request Part explicitly so we can set video_metadata.fps.
     Gemini's File API samples at a fixed 1 FPS by default REGARDLESS of the
     encoded proxy's frame rate — this override is the only way to actually
     change what the model samples.
+
+    media_resolution is a Gemini-3-only per-part override (see
+    GOAL_MEDIA_RESOLUTION); pass None for older/fallback models.
     """
     file_uri  = getattr(uploaded_file, "uri", None)
     mime_type = getattr(uploaded_file, "mime_type", None) or "video/mp4"
@@ -937,6 +995,7 @@ def _video_part(uploaded_file: Any, fps: float | None) -> Any:
     return types.Part(
         file_data=types.FileData(file_uri=file_uri, mime_type=mime_type),
         video_metadata=types.VideoMetadata(fps=fps) if fps else None,
+        media_resolution=media_resolution,
     )
 
 
@@ -947,13 +1006,19 @@ def _call_model_with_retry(
     fps: float,
     prompt: str,
     label: str,
+    media_resolution: Any = None,
 ) -> Any:
+    # Gemini-3-only feature — only send it to models in that family.
+    part_resolution = media_resolution if model.startswith("gemini-3") else None
+    config = types.GenerateContentConfig(temperature=DEFAULT_TEMPERATURE)
+
     last_exc: Exception | None = None
     for attempt in range(1, API_RETRIES_PER_CALL + 1):
         try:
             return client.models.generate_content(
                 model=model,
-                contents=[_video_part(uploaded_file, fps), prompt],
+                contents=[_video_part(uploaded_file, fps, part_resolution), prompt],
+                config=config,
             )
         except Exception as exc:
             last_exc = exc
@@ -984,6 +1049,7 @@ def _run_goal_pass_for_chunk(
                     client, model, uploaded_file, goal_fps,
                     build_goal_detection_prompt(chunk.duration, attempt),
                     f"{label}/chunk{chunk.index}/Goal",
+                    media_resolution=GOAL_MEDIA_RESOLUTION,
                 )
                 return parse_goals_response(response.text or "", chunk.duration)
             except AnalysisError as exc:
@@ -1030,7 +1096,8 @@ def _run_general_pass_for_chunk(
 
 def _process_chunk(
     client: genai.Client,
-    models: list[str],
+    goal_models: list[str],
+    general_models: list[str],
     input_video_path: str,
     chunk: ChunkSpec,
     work_dir: str,
@@ -1049,8 +1116,8 @@ def _process_chunk(
     try:
         uploaded_file = _upload_with_retry(client, proxy_path, f"{label}/chunk{chunk.index}")
 
-        goal_events    = _run_goal_pass_for_chunk(client, models, uploaded_file, chunk, label)
-        general_events = _run_general_pass_for_chunk(client, models, uploaded_file, chunk, label)
+        goal_events    = _run_goal_pass_for_chunk(client, goal_models, uploaded_file, chunk, label)
+        general_events = _run_general_pass_for_chunk(client, general_models, uploaded_file, chunk, label)
         merged = merge_goals_into_events(goal_events, general_events)
 
         for event in merged:
@@ -1078,7 +1145,8 @@ def _process_chunk(
 
 def _run_genai_analysis(
     client: genai.Client,
-    models: list[str],
+    goal_models: list[str],
+    general_models: list[str],
     input_video_path: str,
     video_duration: float,
     label: str,
@@ -1099,7 +1167,7 @@ def _run_genai_analysis(
     try:
         for chunk in chunks:
             chunk_events = _process_chunk(
-                client, models, input_video_path, chunk, work_dir, font_path, label
+                client, goal_models, general_models, input_video_path, chunk, work_dir, font_path, label
             )
             all_events.extend(chunk_events)
     finally:
@@ -1128,7 +1196,8 @@ def try_gemini(input_video_path: str, video_duration: float) -> dict[str, Any] |
     try:
         client = genai.Client(api_key=key)
         return _run_genai_analysis(
-            client, get_model_candidates(), input_video_path, video_duration, "Gemini",
+            client, get_goal_model_candidates(), get_model_candidates(),
+            input_video_path, video_duration, "Gemini",
         )
     except Exception as exc:
         logging.warning("Gemini failed: %s", exc)
@@ -1146,8 +1215,10 @@ def try_gemma(input_video_path: str, video_duration: float) -> dict[str, Any] | 
         return None
     try:
         client = genai.Client(api_key=key)
+        gemma_models = get_gemma_model_candidates()
         return _run_genai_analysis(
-            client, get_gemma_model_candidates(), input_video_path, video_duration, "Gemma",
+            client, gemma_models, gemma_models,  # no Pro tier in Gemma — one list, both passes
+            input_video_path, video_duration, "Gemma",
         )
     except Exception as exc:
         logging.warning("Gemma failed: %s", exc)
