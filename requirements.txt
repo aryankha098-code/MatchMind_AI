@@ -1,13 +1,21 @@
-﻿google-genai>=1.0.0
-google-api-python-client==2.147.0
-google-auth==2.35.0
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.1
+﻿# Google APIs & Authentication
+google-genai>=1.0.0
+google-api-python-client>=2.147.0
+google-auth>=2.35.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+
+# Computer Vision & Data Processing
 numpy>=1.26.0
 opencv-python-headless>=4.9.0.80
-openai>=1.0.0
-python-dotenv>=1.0.1
-uvicorn
-fastapi
-python-multipart
 
+# AI Models & LLMs
+openai>=1.0.0
+
+# Web Framework & Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+python-multipart>=0.0.9
+
+# Environment & Utilities
+python-dotenv>=1.0.1
