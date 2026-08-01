@@ -1,15 +1,145 @@
 # AI Football Video Highlights
 
-FastAPI service that accepts a football match video, analyzes it with Gemini, generates a TV-style highlight reel with FFmpeg, uploads the result to Google Drive, and emails a notification.
+A backend pipeline that takes a raw football match video, analyzes it with Gemini (Gemma as fallback), generates a TV-style highlight reel with FFmpeg (slow-motion + zoom on goals), uploads the highlights to Google Drive and YouTube, and emails the result links.
 
-## Flow
+It's a pure API — there is no web upload page. It's meant to be driven by a script, `curl`/Postman, or an automation tool such as n8n.
 
-1. `POST /process` receives a video from n8n and saves it as `match.mp4`.
-2. `server.py` starts the pipeline in a background task and returns `{"status": "started"}` immediately.
-3. `analyze.py` uploads the video to Gemini and writes coarse candidate events to `timestamps.json`.
-4. `event_refiner.py` scans rough timestamp windows frame-by-frame with OpenCV and writes `refined_events.json`.
-5. `generate_highlights.py` creates frame-aligned `highlights.mp4` and `included_moments.json`.
-6. `upload_and_notify.py` uploads the video to Google Drive and sends success or failure email.
+## How It Works
+
+| Stage | Script | Reads | Writes |
+|---|---|---|---|
+| API server | `server.py` | uploaded file | `match.mp4`, in-memory job status |
+| 1. Analyze | `analyze.py` | `match.mp4` | `timestamps.json` |
+| 2. Refine | `event_refiner.py` | `match.mp4`, `timestamps.json` | `refined_events.json` |
+| 3. Generate | `generate_highlights.py` | `match.mp4`, `refined_events.json` | `highlights.mp4`, `included_moments.json` |
+| 4. Upload & notify | `upload_and_notify.py` | `highlights.mp4`, `included_moments.json` | `upload_results.json`, an email |
+
+1. `POST /process` with the video file attached — `server.py` saves it as `match.mp4` and immediately returns `{"status": "started"}`, then runs the four stages below in the background.
+2. `analyze.py` splits the match into overlapping chunks, burns a running clock into each one, and asks Gemini to find every highlight-worthy moment (goals get a dedicated, higher-accuracy detection pass). Writes `timestamps.json`.
+3. `event_refiner.py` uses OpenCV (motion, ball tracking, scoreboard change, audio) to correct the important events (goals, penalties, saves, near-misses, shots on target) to an exact video frame. Writes `refined_events.json`.
+4. `generate_highlights.py` selects the best ~12–15 minutes of events, cuts a clip for each with FFmpeg (slow-motion replay + tracking zoom for goals), and concatenates everything into `highlights.mp4`. Writes `included_moments.json`.
+5. `upload_and_notify.py` uploads `highlights.mp4` to Google Drive and YouTube, then emails the links via the Gmail API. Writes `upload_results.json`.
+6. Poll `GET /status` at any time to see which stage is running, or whether the job finished (`done`) or failed (`error`).
+
+> **Note:** only `highlights.mp4` is uploaded — the original full match (`match.mp4`) is not currently published anywhere by this pipeline.
+
+## Local Setup
+
+Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Install FFmpeg and ffprobe, then confirm both are on `PATH`:
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+Copy `env.example` to `.env` and fill in your keys (see [Configuration](#configuration) below):
+
+```bash
+cp env.example .env
+```
+
+Run the server:
+
+```bash
+uvicorn server:app --reload
+```
+
+Trigger a job (there is no browser UI — use a tool that can send a multipart POST):
+
+```bash
+curl -X POST http://localhost:8000/process -F "file=@match.mp4"
+curl http://localhost:8000/status
+```
+
+## Google Cloud Setup
+
+This project authenticates to **Drive, YouTube, and Gmail all through one OAuth client and one cached token** — there's no separate Gmail app password or SMTP config.
+
+1. Create/select a project in [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable **YouTube Data API v3** and **Google Drive API**.
+3. Configure the OAuth consent screen (External user type is fine for testing) and add the Google account you'll use as a **test user** while the app is in "Testing" mode.
+4. Create an **OAuth Client ID** with application type **Desktop app**, and download the JSON.
+5. Rename it to `oauth_client_secret.json` and place it in the project root.
+6. Get a **Gemini API key** from [Google AI Studio](https://aistudio.google.com/app/apikey).
+
+On first run, `upload_and_notify.py` opens a one-time browser login covering all three scopes below and caches the result to `token.json` — you won't be asked again unless the scopes change.
+
+```text
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/youtube.upload
+https://www.googleapis.com/auth/gmail.send
+```
+
+If `token.json` was created by an older version of this project (Drive-only, or before Gmail API sending was added), delete it and run the pipeline again so it can re-consent with all three scopes at once.
+
+## Google Drive Setup
+
+Create or choose a Drive folder for the finished highlight uploads. Copy the folder ID from its URL:
+
+```text
+https://drive.google.com/drive/folders/<this-part-is-the-folder-id>
+```
+
+```text
+GDRIVE_OUTPUT_FOLDER_ID=your_folder_id
+```
+
+Uploaded files are set to "anyone with the link can view."
+
+## YouTube Quota
+
+The YouTube Data API's default daily quota is 10,000 units; a video upload costs roughly 1,600 units. Since this pipeline uploads **one** video per run (`highlights.mp4` only), that's about **6 full pipeline runs per day** on the default quota. Drive uploads don't use YouTube quota.
+
+## Configuration
+
+All settings are environment variables loaded from `.env` (see `env.example` for the full, current list). The most important ones:
+
+```text
+GEMINI_API_KEY=                                   # required (or GEMMA_API_KEY as fallback)
+GEMMA_API_KEY=
+
+GOOGLE_OAUTH_CLIENT_SECRET_JSON=oauth_client_secret.json
+GOOGLE_OAUTH_TOKEN_JSON=token.json
+
+GDRIVE_OUTPUT_FOLDER_ID=                          # required
+NOTIFY_EMAIL=                                     # required
+
+YOUTUBE_PRIVACY_STATUS=unlisted
+YOUTUBE_UPLOAD_TIMEOUT_SECONDS=1800
+YOUTUBE_UPLOAD_CHUNK_MB=8
+```
+
+Video-analysis tuning (see `analyze.py`'s module docstring for the full rationale behind these defaults):
+
+```text
+ANALYZE_CHUNK_SECONDS=480          # length of each chunk analyzed per Gemini call (8 min)
+ANALYZE_CHUNK_OVERLAP_SECONDS=30   # overlap between consecutive chunks
+ANALYZE_CHUNK_PROXY_WIDTH=1536     # Gemini's real tiling ceiling — no benefit going higher
+ANALYZE_CHUNK_PROXY_FPS=15         # encoded fps, for a smooth burned-in clock
+ANALYZE_CHUNK_PROXY_CRF=18
+ANALYZE_BURN_TIMECODE=true         # burns a running clock into each chunk so the model reads
+                                    # the exact second instead of estimating it
+ANALYZE_KEEP_AUDIO=true            # crowd roar / commentary is a strong goal signal
+ANALYZE_GOAL_SAMPLE_FPS=5.0        # higher sample rate for the dedicated goal-detection pass
+ANALYZE_GENERAL_SAMPLE_FPS=1.0
+GEMINI_MODELS=gemini-3.6-flash,gemini-3.5-flash,gemini-3.1-flash-lite,gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash
+GEMINI_GOAL_MODEL=gemini-3.1-pro-preview   # tried first for goals only; requires billing enabled,
+                                            # falls back to GEMINI_MODELS automatically if unavailable
+```
+
+Frame-refinement and highlight-generation tuning:
+
+```text
+REFINE_HIGH_PRECISION_TYPES=goal,penalty,save,near_miss,shot_on_target
+GOAL_SLOWMO_OUTPUT_SECONDS=9       # clamped to 7-10
+HIGHLIGHT_MAX_WORKERS=2            # parallel FFmpeg workers extracting clips
+```
 
 ## API
 
@@ -19,98 +149,74 @@ Start a job:
 POST /process
 ```
 
+Multipart form data, file field name:
+
+```text
+file
+```
+
 Poll job status:
 
 ```text
 GET /status
 ```
 
-Statuses are `idle`, `processing`, `done`, or `error`.
+```json
+{
+  "status": "processing",
+  "step": "generate",
+  "message": "Generating highlight reel.",
+  "original_filename": "match.mp4"
+}
+```
 
-## Environment
+`status` is one of `idle`, `processing`, `done`, `error`. `step` is one of `queued`, `analyze`, `refine`, `generate`, `upload`, `complete`.
+
+Result links (once uploaded) are written to `upload_results.json` and included in the notification email:
+
+```json
+{
+  "result_links": [
+    { "label": "Highlights (Drive)", "url": "https://drive.google.com/file/d/.../view" },
+    { "label": "Highlights (YouTube)", "url": "https://youtu.be/..." }
+  ]
+}
+```
+
+## Docker
+
+Build:
+
+```bash
+docker build -t football-highlights-api .
+```
+
+Run, with credentials and env mounted in:
+
+```bash
+docker run --name football-highlights-api \
+  --env-file .env \
+  -p 8000:8000 \
+  -v "$(pwd)/oauth_client_secret.json:/app/oauth_client_secret.json:ro" \
+  -v "$(pwd)/token.json:/app/token.json" \
+  football-highlights-api
+```
+
+(PowerShell: replace `\` line continuations with `` ` `` and `$(pwd)` with `${PWD}`.)
+
+## Output Files
+
+Runtime files are created in the app's working directory as the pipeline runs:
 
 ```text
-GEMINI_API_KEY=
-OPENAI_API_KEY=
-GOOGLE_SERVICE_ACCOUNT_JSON=service_account.json
-GDRIVE_OUTPUT_FOLDER_ID=
-GMAIL_SENDER=
-GMAIL_APP_PASSWORD=
-NOTIFY_EMAIL=
+match.mp4
+timestamps.json
+refined_events.json
+included_moments.json
+highlights.mp4
+upload_results.json
 ```
 
+## Security
 
-## Output
-
-The generator targets broadcast-friendly output:
-
-- `1920x1080`
-- `30fps`
-- H.264 video at `4000k`
-- AAC audio at `192k`
-- black clip fades
-- short broadcast-style transitions
-- lower-third event labels
-- event scoring for goals, assists, near misses, saves, dangerous attacks, dribbles, tackles, celebrations, and crowd reactions
-- target duration selection for roughly 12-15 minutes when enough quality events exist
-- duplicate-event merging so one play appears only once
-- goal and save premium effects: frame-aligned `0.5x` slow motion plus smooth action-centered zoom
-- lighter zoom-only effects for near misses, dribbles, tackles, and celebrations
-- goal effects start at the refined event frame and target about 9 seconds of slow-motion output
-- goal clips include build-up, shot, aftermath, and celebration context when nearby detections overlap
-
-## Faster Analysis
-
-`analyze.py` keeps `match.mp4` as the source, but uploads a small temporary proxy to Gemini by default:
-
-```text
-ANALYZE_USE_PROXY=true
-ANALYZE_PROXY_WIDTH=854
-ANALYZE_PROXY_FPS=4
-ANALYZE_PROXY_CRF=28
-ANALYZE_CHUNKED=true
-ANALYZE_CHUNK_SECONDS=600
-ANALYZE_CHUNK_OVERLAP_SECONDS=5
-```
-
-The proxy is split into 10-minute analysis chunks before upload. Each chunk is analyzed separately, then timestamps are offset back into the full-match timeline. This prevents long videos from producing events only from the opening minutes.
-
-`event_refiner.py` is optimized to run expensive OpenCV frame scanning only for the event types that need precise effect timing:
-
-```text
-REFINE_HIGH_PRECISION_TYPES=goal,penalty,save,near_miss,shot_on_target
-```
-
-Other events keep Gemini/OpenAI's rough timestamp converted to a frame number, which makes the backend faster while preserving accuracy for goals, saves, and near misses.
-
-The analyzer and generator reject event timelines that only cover the opening part of the video. For full-match coverage, events are checked in 10-minute segments:
-
-```text
-COVERAGE_SEGMENT_SECONDS=600
-```
-
-If Gemini returns a temporary high-demand error such as `503 UNAVAILABLE`, `analyze.py` retries automatically with backoff. You can also configure fallback models:
-
-```text
-GEMINI_MODELS=gemini-3.5-flash,gemini-2.5-flash
-```
-
-If Gemini still fails and `OPENAI_API_KEY` is set, `analyze.py` falls back to OpenAI vision analysis by sampling timestamped storyboard frames:
-
-```text
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
-OPENAI_FALLBACK_MAX_FRAMES=120
-OPENAI_FALLBACK_FRAME_WIDTH=512
-```
-
-The generator first merges overlapping detections into unique broadcast moments, selects strong moments from across the match timeline, fills the remaining duration by score, then restores chronological order.
-
-## Local Run
-
-```powershell
-pip install -r requirements.txt
-uvicorn server:app --host 0.0.0.0 --port 8000
-```
-
-FFmpeg and FFprobe must be installed and available on `PATH`.
+**Never commit `.env`, `oauth_client_secret.json`, or `token.json`** — all three are already excluded via `.gitignore`/`.dockerignore`, and that should stay that way. If any of them is ever exposed (e.g. shared in a support ticket, chat, or public repo), treat it as compromised: regenerate the OAuth client in Google Cloud Console, issue a fresh `oauth_client_secret.json`, and rotate the Gemini API key.
